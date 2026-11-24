@@ -10,6 +10,7 @@ objc2-foundation = "0.3"
 objc2-metal = "0.3"
 block2 = "0.6"
 libc = "0.2"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]
 opt-level = 3

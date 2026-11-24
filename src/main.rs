@@ -2,6 +2,7 @@ mod engine;
 mod gguf;
 mod metal;
 mod sampler;
+mod server;
 mod session;
 mod tokenizer;
 mod unicode_tables;
@@ -24,6 +25,9 @@ commands:
   run -p TEXT       one prompt, streamed
   bench             greedy prefill + decode benchmark
   check --ref P     compare logits against a llama.cpp reference dump (tools/ref_logits)
+  serve             OpenAI-compatible HTTP server: --host H --port P (default 127.0.0.1:8090), --alias NAME (repeatable;
+                    the first is reported), --default-effort E (requests without reasoning_effort; default: the
+                    template's, high), --cache-mib N (conversation cache, default 8192), -c CTX (default 131072)
 
 options:
   -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
@@ -44,6 +48,8 @@ options:
 struct Opts {
     model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
     system: String, temp: f32, top_p: f32, top_k: usize, seed: u64, hide_thinking: bool, n_set: bool,
+    // serve
+    host: String, port: u16, aliases: Vec<String>, default_effort: Option<String>, cache_mib: usize, ctx_set: bool,
 }
 
 fn parse() -> (String, Opts) {
@@ -52,7 +58,8 @@ fn parse() -> (String, Opts) {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut o = Opts { model: DEFAULT_MODEL.replace('~', &home), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
                        raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
-                       temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false };
+                       temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false,
+                       host: "127.0.0.1".into(), port: 8090, aliases: Vec::new(), default_effort: None, cache_mib: 8192, ctx_set: false };
     while let Some(a) = args.next() {
         let mut v = || args.next().unwrap_or_else(|| { eprintln!("missing value for {a}"); std::process::exit(2) });
         match a.as_str() {
@@ -60,7 +67,12 @@ fn parse() -> (String, Opts) {
             "-p" | "--prompt" => o.prompt = v(),
             "-f" | "--file" => o.prompt = std::fs::read_to_string(v()).expect("read prompt file"),
             "-n" => { o.n = v().parse().unwrap(); o.n_set = true; }
-            "-c" | "--ctx" => o.ctx = v().parse::<usize>().unwrap().div_ceil(64) * 64,
+            "-c" | "--ctx" => { o.ctx = v().parse::<usize>().unwrap().div_ceil(64) * 64; o.ctx_set = true; }
+            "--host" => o.host = v(),
+            "--port" => o.port = v().parse().unwrap(),
+            "--alias" => o.aliases.push(v()),
+            "--default-effort" => o.default_effort = Some(v()),
+            "--cache-mib" => o.cache_mib = v().parse().unwrap(),
             "--raw" => o.raw = true,
             "--kv8" => engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed),
             "--kv-disk" => engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -111,7 +123,13 @@ fn run(o: &Opts) {
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let toks = tk.encode(&text, true);
     eng.prepare(toks.len(), toks.len());       // working memory for this prompt, mapped before the prefill starts
-    let first = sess.prefill(&toks);
+    // dev: INK_SPLIT_LAST=k prefills all but the last k tokens, then those k; with k=1 that last batch is a single
+    // token, which the batched prefill gets wrong on a long context (garbage at 21K) - INK_FEED_ONE feeds it through
+    // a decode step instead, as `serve` does
+    let first = if let Some(k) = std::env::var("INK_SPLIT_LAST").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&k| k > 0 && k < toks.len()) {
+        sess.prefill(&toks[..toks.len() - k]);
+        if std::env::var("INK_FEED_ONE").is_ok() { sess.prefill_any(&toks[toks.len() - k..]) } else { sess.prefill(&toks[toks.len() - k..]) }
+    } else { sess.prefill(&toks) };
     let mut out = std::io::stdout();
     let mut r = Renderer::new(!o.hide_thinking, o.raw);
     sess.generate(first, o.n, &mut sampler, |t| { if !o.quiet { r.push(&tk, t, &mut out); } true });
@@ -624,6 +642,16 @@ fn main() {
                 println!("{n:>14}: all {:6.1} GB/s | Q8_0 {:6.1} | Q5_0 {:6.1}", eng.kbench_down(n, nr * nsg, 32 * nsg, 0),
                          eng.kbench_down(n, nr * nsg, 32 * nsg, 8), eng.kbench_down(n, nr * nsg, 32 * nsg, 6));
             }
+        }
+        "serve" => server::serve(server::ServeOpts {
+            model: o.model.clone(), ctx: if o.ctx_set { o.ctx } else { 131072 }, host: o.host.clone(), port: o.port,
+            aliases: if o.aliases.is_empty() { vec!["Inkling-2-Mini".into()] } else { o.aliases.clone() },
+            default_effort: o.default_effort.clone(), cache_mib: o.cache_mib, top_k: 128,
+        }),
+        // dev: print the prompt `serve` renders for a chat request (JSON body in -f FILE)
+        "render" => {
+            let req: serde_json::Value = serde_json::from_str(&o.prompt).expect("request JSON");
+            match server::render(&req, o.default_effort.as_deref()) { Ok(p) => print!("{p}"), Err(e) => { eprintln!("{e}"); std::process::exit(1) } }
         }
         "run" => run(&o),
         "chat" => chat(&o),

@@ -53,6 +53,10 @@ struct Tier {
 }
 #[derive(Clone, Copy)]
 struct Chunk { exec: usize, kind: usize, i: usize, c0: usize, c1: usize, round: usize, off: usize, sp0: usize, ns: usize, kps: usize }
+/// a copy of the context state (see `Engine::save_state`)
+pub struct StateSnap { pub n: usize, swa_rows: usize, swa: Vec<u8>, full: Vec<u8>, cs: Vec<u8>, toks: Vec<u8> }
+impl StateSnap { pub fn bytes(&self) -> usize { self.swa.len() + self.full.len() + self.cs.len() + self.toks.len() } }
+
 /// how one layer execution's keys are divided: file chunks cover the splits before `b`, the hot ring the `ns` splits from `sp0`
 #[derive(Clone, Copy)]
 struct ExecPlan { b: usize, kps: usize, nsplit: usize, sp0: usize, ns: usize }
@@ -541,6 +545,50 @@ impl Engine {
     }
     /// bind the K/V buffer a layer's kernels address through buffer 3
     fn bind_kv(&self, e: &Enc, swa: bool) { if swa { e.buf(&self.kv_swa.borrow(), 0, 3); } else { e.buf(&self.kv_full.borrow(), 0, 3); } }
+    /// The whole context state after `n` positions, copied out of the GPU's (shared) buffers: the K/V rows of every
+    /// slot (a sliding-window slot's ring holds min(n, window) of them), the conv state and the token ids. With
+    /// `load_state` this lets a server keep several conversations and resume any of them where a prompt diverges
+    /// (the K/V cache alone cannot be cut back: the conv state is recurrent and the window rings overwrite).
+    /// Nothing may be in flight on the GPU. Not with --kv-disk.
+    pub fn save_state(&self, n: usize) -> StateSnap {
+        assert!(!self.tier_on(), "save_state with the disk tier");
+        let row = HD * self.kvb;
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let take = |buf: &RefCell<Buf>, cap: usize, rows: usize, nslots: usize| -> Vec<u8> {
+            let src = buf.borrow().contents().as_ptr() as *const u8;
+            let mut v = Vec::with_capacity(nslots * 2 * NKV * rows * row);
+            for blk in 0..nslots * 2 * NKV {
+                v.extend_from_slice(unsafe { std::slice::from_raw_parts(src.add(blk * cap * row), rows * row) });
+            }
+            v
+        };
+        let swa_rows = n.min(EXT).min(self.swa_cap.get());
+        let swa = take(&self.kv_swa, self.swa_cap.get(), swa_rows, n_swa);
+        let full = take(&self.kv_full, self.full_cap.get(), n, N_SLOT - n_swa);
+        let cs = unsafe { std::slice::from_raw_parts(self.cs.contents().as_ptr() as *const u8, self.cs.length()) }.to_vec();
+        let toks = unsafe { std::slice::from_raw_parts(self.toks.contents().as_ptr() as *const u8, (n + 1) * 4) }.to_vec();
+        StateSnap { n, swa_rows, swa, full, cs, toks }
+    }
+    /// Put a `save_state` copy back: the context becomes exactly the one saved (n positions).
+    pub fn load_state(&self, s: &StateSnap) {
+        assert!(!self.tier_on(), "load_state with the disk tier");
+        self.reserve(s.n + 1, true);
+        let row = HD * self.kvb;
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let put = |buf: &RefCell<Buf>, cap: usize, rows: usize, nslots: usize, data: &[u8]| {
+            let dst = buf.borrow().contents().as_ptr() as *mut u8;
+            for blk in 0..nslots * 2 * NKV {
+                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(blk * rows * row), dst.add(blk * cap * row), rows * row); }
+            }
+        };
+        put(&self.kv_swa, self.swa_cap.get(), s.swa_rows, n_swa, &s.swa);
+        put(&self.kv_full, self.full_cap.get(), s.n, N_SLOT - n_swa, &s.full);
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.cs.as_ptr(), self.cs.contents().as_ptr() as *mut u8, s.cs.len());
+            std::ptr::copy_nonoverlapping(s.toks.as_ptr(), self.toks.contents().as_ptr() as *mut u8, s.toks.len());
+        }
+    }
+
     /// positions the K/V cache can hold right now
     pub fn kv_capacity(&self) -> usize { if self.swa_cap.get() >= EXT { self.full_cap.get() } else { self.swa_cap.get().min(self.full_cap.get()) } }
     /// first position a generation loop must call `gen_reserve` for (with an idle GPU) before it may run that step

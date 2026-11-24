@@ -31,6 +31,15 @@ impl<'a> Session<'a> {
 
     pub fn ctx_left(&self) -> usize { self.eng.max_ctx.saturating_sub(self.n_past + 1) }
 
+    /// a sampled token that is not in the context yet (`prefill` feeds it first)
+    pub fn pending(&self) -> Option<u32> { self.pending }
+    /// forget the context and start empty
+    pub fn clear(&mut self) { self.eng.reset(); self.n_past = 0; self.pending = None; }
+    /// make the context the one `snap` holds
+    pub fn restore(&mut self, snap: &crate::engine::StateSnap) { self.eng.load_state(snap); self.n_past = snap.n; self.pending = None; }
+    /// drop the pending token (its state was never computed), keeping the context as it is
+    pub fn drop_pending(&mut self) { self.pending = None; }
+
     /// Feed `toks` (preceded by any pending sampled token) through the model in prefill chunks.
     /// Returns the greedy next token (argmax of the last position); logits stay available in the engine.
     pub fn prefill(&mut self, toks: &[u32]) -> u32 {
@@ -60,6 +69,27 @@ impl<'a> Session<'a> {
         self.stats.prompt_tokens += all.len();
         self.stats.prompt_time += t0.elapsed();
         self.eng.token_at(end)
+    }
+
+    /// Feed one token through a decode step (the path generation takes for every token) and return the greedy next
+    /// token; logits stay available. A prefill batch of a single token on a long context is not exact (measured at
+    /// 21K tokens: garbage output), so callers use this for lone tokens.
+    pub fn feed_one(&mut self, t: u32) -> u32 {
+        assert!(self.pending.is_none());
+        assert!(self.n_past + 1 < self.eng.max_ctx, "context full ({} tokens)", self.eng.max_ctx);
+        let t0 = Instant::now();
+        self.eng.set_tokens(self.n_past, &[t]);
+        self.eng.gen_reserve(self.n_past);
+        self.eng.step(self.n_past, true, true).waitUntilCompleted();
+        self.n_past += 1;
+        self.stats.prompt_tokens += 1;
+        self.stats.prompt_time += t0.elapsed();
+        self.eng.token_at(self.n_past)
+    }
+
+    /// `prefill`, except that a single token goes through `feed_one`
+    pub fn prefill_any(&mut self, toks: &[u32]) -> u32 {
+        if toks.len() == 1 && self.pending.is_none() { self.feed_one(toks[0]) } else { self.prefill(toks) }
     }
 
     /// Generate up to `max` tokens after a prefill. `on_token` returns false to stop early.
