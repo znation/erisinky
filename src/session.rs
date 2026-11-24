@@ -16,6 +16,8 @@ pub struct Session<'a> {
     /// a sampled token not yet fed through the model (it becomes the first input of the next step)
     pending: Option<u32>,
     pub stats: Stats,
+    /// the engine lane this session's context lives in (every operation selects it first)
+    pub lane: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -24,21 +26,25 @@ pub struct Stats { pub prompt_tokens: usize, pub prompt_time: Duration, pub gen_
                    pub peak_scratch: usize }
 
 impl<'a> Session<'a> {
-    pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> {
+    pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> { Session::on_lane(eng, tk, eng.lane()) }
+    /// a session on engine lane `lane`, starting empty
+    pub fn on_lane(eng: &'a Engine, tk: &'a Tokenizer, lane: usize) -> Session<'a> {
+        eng.select_lane(lane);
         eng.reset();
-        Session { eng, tk, n_past: 0, pending: None, stats: Stats::default() }
+        Session { eng, tk, n_past: 0, pending: None, stats: Stats::default(), lane }
     }
 
     pub fn ctx_left(&self) -> usize { self.eng.max_ctx.saturating_sub(self.n_past + 1) }
 
-    /// a sampled token that is not in the context yet (`prefill` feeds it first)
-    pub fn pending(&self) -> Option<u32> { self.pending }
     /// forget the context and start empty
-    pub fn clear(&mut self) { self.eng.reset(); self.n_past = 0; self.pending = None; }
+    pub fn clear(&mut self) { self.eng.select_lane(self.lane); self.eng.reset(); self.n_past = 0; self.pending = None; }
     /// make the context the one `snap` holds
-    pub fn restore(&mut self, snap: &crate::engine::StateSnap) { self.eng.load_state(snap); self.n_past = snap.n; self.pending = None; }
-    /// drop the pending token (its state was never computed), keeping the context as it is
-    pub fn drop_pending(&mut self) { self.pending = None; }
+    pub fn restore(&mut self, snap: &crate::engine::StateSnap) {
+        self.eng.select_lane(self.lane); self.eng.load_state(snap); self.n_past = snap.n; self.pending = None;
+    }
+    /// copy this context's state out (see `Engine::save_state`)
+    pub fn save(&self) -> crate::engine::StateSnap { self.eng.select_lane(self.lane); self.eng.save_state(self.n_past) }
+
 
     /// Feed `toks` (preceded by any pending sampled token) through the model in prefill chunks.
     /// Returns the greedy next token (argmax of the last position); logits stay available in the engine.
@@ -47,6 +53,7 @@ impl<'a> Session<'a> {
         all.extend_from_slice(toks);
         assert!(!all.is_empty());
         assert!(self.n_past + all.len() < self.eng.max_ctx, "context full ({} tokens)", self.eng.max_ctx);
+        self.eng.select_lane(self.lane);
         let t0 = Instant::now();
         self.eng.tier_leave(self.n_past);       // (--kv-disk) a prefill attends through the whole cache in memory
         self.eng.set_tokens(self.n_past, &all);
@@ -77,6 +84,7 @@ impl<'a> Session<'a> {
     pub fn feed_one(&mut self, t: u32) -> u32 {
         assert!(self.pending.is_none());
         assert!(self.n_past + 1 < self.eng.max_ctx, "context full ({} tokens)", self.eng.max_ctx);
+        self.eng.select_lane(self.lane);
         let t0 = Instant::now();
         self.eng.set_tokens(self.n_past, &[t]);
         self.eng.gen_reserve(self.n_past);
@@ -100,6 +108,7 @@ impl<'a> Session<'a> {
     pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> usize {
         let t0 = Instant::now();
         let eng = self.eng;
+        eng.select_lane(self.lane);
         // INK_IGNORE_EOS (benchmarks): decode exactly `max` tokens, as llama-bench's tg does
         let eos = if std::env::var("INK_IGNORE_EOS").is_ok() { u32::MAX } else { self.tk.eos };
         eng.release_batch();      // the prefill arena is not needed while generating

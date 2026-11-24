@@ -372,6 +372,17 @@ pub struct Engine {
     pub stop: std::cell::Cell<usize>, done: std::cell::Cell<usize>, pub last_out: std::cell::Cell<usize>, pub last_mid: std::cell::Cell<usize>,
     pub max_ctx: usize,
     pub n_vocab: usize,
+    // ---- lanes: independent sequences sharing the weights (batched decode, see `encode_step_batch`)
+    /// number of lanes; lane state lives in per-lane K/V buffers and in lane-strided regions of cs / toks / ctr / the
+    /// decode arena. Everything single-sequence works on the current lane (`select_lane`).
+    pub nlanes: usize,
+    lane: Cell<usize>,
+    /// the K/V buffers (and capacities) of the lanes that are not current; the current lane's are in kv_swa/kv_full
+    lanes_kv: RefCell<Vec<Option<(Buf, Buf, usize, usize)>>>,
+    /// decode-arena stride per lane, f32 elements (the batch arena of prefills comes after all lanes)
+    astride: u32,
+    /// the lane whose arena holds the logits `logits()` returns (a prefill computes in lane 0's arena)
+    logits_lane: Cell<usize>,
     eps: f32, log_alpha: f32, log_floor: f32, situ_beta: f32, situ_lbeta: f32, wscale: f32, pub softcap: f32,
 }
 
@@ -381,8 +392,14 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 
 impl Engine {
     pub fn load(path: &str, max_ctx: usize) -> Engine { Engine::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed)) }
+    /// `nlanes` independent sequences (each up to `max_ctx`), decodable together with `encode_step_batch`
+    pub fn load_lanes(path: &str, max_ctx: usize, nlanes: usize) -> Engine {
+        Engine::load_full(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed), nlanes)
+    }
     /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
-    pub fn load_with(path: &str, max_ctx: usize, kv8: bool) -> Engine {
+    pub fn load_with(path: &str, max_ctx: usize, kv8: bool) -> Engine { Engine::load_full(path, max_ctx, kv8, 1) }
+    fn load_full(path: &str, max_ctx: usize, kv8: bool, nlanes: usize) -> Engine {
+        assert!(nlanes >= 1);
         let t0 = std::time::Instant::now();
         let g = Gguf::open(path).expect("open gguf");
         let arch = match &g.kv["general.architecture"] { Value::S(s) => s.clone(), _ => String::new() };
@@ -476,7 +493,8 @@ impl Engine {
         assert!(chunk % 32 == 0 && chunk <= 4096);
         assert!(max_ctx % 64 == 0, "context size must be a multiple of 64");
         // the batch arena is allocated when a prefill needs it and released when generation starts
-        let act = gpu.buffer(ar.total as usize * 4);
+        let astride = ar.total.div_ceil(64) * 64;
+        let act = gpu.buffer(astride as usize * nlanes * 4);
         // K/V cache layout: per slot [K: NKV x cap x HD][V: NKV x cap x HD] halfs, sliding-window and full slots in separate
         // buffers that both grow with the context (Metal commits a buffer when it is created, so capacity is real memory)
         let mut slot_kind = Vec::new();
@@ -489,12 +507,16 @@ impl Engine {
         let cap0 = KV_CAP0.min(max_ctx);
         let kv_swa = gpu.buffer(n_swa * 2 * NKV * cap0 * HD * kvb);
         let kv_full = gpu.buffer(n_full * 2 * NKV * cap0 * HD * kvb);
-        let cs = gpu.buffer(N_SLOT * NCH * 3 * 4);
-        let toks = gpu.buffer((max_ctx + 8) * 4);
-        let ctr = gpu.buffer(4096 * 4);
+        let cs = gpu.buffer(N_SLOT * NCH * 3 * 4 * nlanes);
+        let toks = gpu.buffer((max_ctx + 8) * 4 * nlanes);
+        let ctr = gpu.buffer(4096 * 4 * nlanes);
+        // lanes 1.. start with their own (small) K/V buffers; lane 0's are kv_swa/kv_full below
+        let lanes_kv: Vec<Option<(Buf, Buf, usize, usize)>> = (0..nlanes).map(|l| if l == 0 { None } else {
+            Some((gpu.buffer(n_swa * 2 * NKV * cap0 * HD * kvb), gpu.buffer(n_full * 2 * NKV * cap0 * HD * kvb), cap0, cap0)) }).collect();
         eprintln!("[inkling] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
             path.rsplit('/').next().unwrap_or(path), g.file_len as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
         let tier = if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(nlanes == 1, "--kv-disk is single-sequence");
             assert!(!kv8, "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8");
             let path = std::env::temp_dir().join(format!("inkling-kv-{}.bin", std::process::id()));
             let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("create the K/V file");
@@ -524,6 +546,7 @@ impl Engine {
             skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
             last_out: Default::default(), last_mid: Default::default(),
             max_ctx, n_vocab,
+            nlanes, lane: Cell::new(0), lanes_kv: RefCell::new(lanes_kv), astride, logits_lane: Cell::new(0),
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -565,8 +588,9 @@ impl Engine {
         let swa_rows = n.min(EXT).min(self.swa_cap.get());
         let swa = take(&self.kv_swa, self.swa_cap.get(), swa_rows, n_swa);
         let full = take(&self.kv_full, self.full_cap.get(), n, N_SLOT - n_swa);
-        let cs = unsafe { std::slice::from_raw_parts(self.cs.contents().as_ptr() as *const u8, self.cs.length()) }.to_vec();
-        let toks = unsafe { std::slice::from_raw_parts(self.toks.contents().as_ptr() as *const u8, (n + 1) * 4) }.to_vec();
+        let l = self.lane.get();
+        let cs = unsafe { std::slice::from_raw_parts((self.cs.contents().as_ptr() as *const u8).add(l * Self::CS_LANE), Self::CS_LANE) }.to_vec();
+        let toks = unsafe { std::slice::from_raw_parts((self.toks.contents().as_ptr() as *const u8).add(l * self.toks_lane()), (n + 1) * 4) }.to_vec();
         StateSnap { n, swa_rows, swa, full, cs, toks }
     }
     /// Put a `save_state` copy back: the context becomes exactly the one saved (n positions).
@@ -584,8 +608,9 @@ impl Engine {
         put(&self.kv_swa, self.swa_cap.get(), s.swa_rows, n_swa, &s.swa);
         put(&self.kv_full, self.full_cap.get(), s.n, N_SLOT - n_swa, &s.full);
         unsafe {
-            std::ptr::copy_nonoverlapping(s.cs.as_ptr(), self.cs.contents().as_ptr() as *mut u8, s.cs.len());
-            std::ptr::copy_nonoverlapping(s.toks.as_ptr(), self.toks.contents().as_ptr() as *mut u8, s.toks.len());
+            let l = self.lane.get();
+            std::ptr::copy_nonoverlapping(s.cs.as_ptr(), (self.cs.contents().as_ptr() as *mut u8).add(l * Self::CS_LANE), s.cs.len());
+            std::ptr::copy_nonoverlapping(s.toks.as_ptr(), (self.toks.contents().as_ptr() as *mut u8).add(l * self.toks_lane()), s.toks.len());
         }
     }
 
@@ -629,7 +654,7 @@ impl Engine {
     pub fn ensure_batch(&self, t: usize) {
         let t = t.div_ceil(64) * 64;
         if t <= self.ba.get().cap { return; }
-        let nb = BArena::new(self.ar.total, t, self.hgemm, self.kvb);
+        let nb = BArena::new(self.dec_total(), t, self.hgemm, self.kvb);
         self.realloc_act(nb.end as usize * 4);
         self.ba.set(nb);
     }
@@ -641,7 +666,7 @@ impl Engine {
         self.ensure_batch(t.min(self.chunk));
         let cb = self.gpu.cmd();
         let e = Enc::new(&cb);
-        self.bind(&e);
+        self.bind_at(&e, 0);
         // one trivial dispatch per buffer (a window-history copy of key 0 into the scratch guard area) makes the driver wire them
         let b = self.ba.get();
         let a = KvCopyArgs { n: 1, pos0: 0, ring_k: 0, ring_v: 0, cap: 64, sk_off: b.sk, sv_off: b.sv, scap: (EXT + b.cap + 2 * KGUARD) as u32,
@@ -655,12 +680,12 @@ impl Engine {
     /// Give the batch arena back (the decode arena and the last logits stay). Nothing may be in flight on the GPU.
     pub fn release_batch(&self) {
         if self.ba.get().cap == 0 { return; }
-        self.realloc_act(self.ar.total as usize * 4);
+        self.realloc_act(self.dec_total() as usize * 4);
         self.ba.set(BArena::default());
     }
     fn realloc_act(&self, bytes: usize) {
         let nb = self.gpu.buffer(bytes);
-        unsafe { std::ptr::copy_nonoverlapping(self.act.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8, self.ar.total as usize * 4); }
+        unsafe { std::ptr::copy_nonoverlapping(self.act.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8, self.dec_total() as usize * 4); }
         *self.act.borrow_mut() = nb;
     }
     /// bytes of GPU working memory besides the weights: (K/V cache, activations incl. the batch arena if allocated)
@@ -1194,11 +1219,11 @@ impl Engine {
 
     pub fn reset(&self) {
         self.tier_reset();
-        unsafe { std::ptr::write_bytes(self.cs.contents().as_ptr() as *mut u8, 0, self.cs.length()); }
+        unsafe { std::ptr::write_bytes((self.cs.contents().as_ptr() as *mut u8).add(self.lane.get() * Self::CS_LANE), 0, Self::CS_LANE); }
     }
 
     pub fn set_tokens(&self, start: usize, toks: &[u32]) {
-        let p = self.toks.contents().as_ptr() as *mut i32;
+        let p = unsafe { (self.toks.contents().as_ptr() as *mut u8).add(self.lane.get() * self.toks_lane()) } as *mut i32;
         for (i, &t) in toks.iter().enumerate() { unsafe { *p.add(start + i) = t as i32; } }
     }
     pub fn arena(&self, off: u32, n: usize) -> Vec<f32> {
@@ -1262,9 +1287,17 @@ impl Engine {
         }
         true
     }
-    pub fn token_at(&self, i: usize) -> u32 { unsafe { *(self.toks.contents().as_ptr() as *const i32).add(i) as u32 } }
+    pub fn token_at(&self, i: usize) -> u32 { self.token_at_lane(self.lane.get(), i) }
+    pub fn token_at_lane(&self, l: usize, i: usize) -> u32 {
+        unsafe { *((self.toks.contents().as_ptr() as *const u8).add(l * self.toks_lane()) as *const i32).add(i) as u32 }
+    }
     pub fn logits(&self) -> &[f32] {
-        unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(self.ar.logits as usize), self.n_vocab) }
+        self.logits_of(self.logits_lane.get())
+    }
+    /// logits of the last step `l` took part in (a lane's own arena; after a prefill: lane 0's, see `logits`)
+    pub fn logits_of(&self, l: usize) -> &[f32] {
+        let off = l * self.astride as usize + self.ar.logits as usize;
+        unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
 
     /// micro-benchmark a Q4_K matvec variant over the gate_up expert weights of every layer (no cache reuse)
@@ -1591,8 +1624,34 @@ impl Engine {
     }
 
     fn bind(&self, e: &Enc) {
-        e.buf(&self.w, 0, 0); e.buf(&self.pb, 0, 1); e.buf(&self.act.borrow(), 0, 2); e.buf(&self.kv_swa.borrow(), 0, 3); e.buf(&self.cs, 0, 4); e.buf(&self.toks, 0, 6);
-        e.buf(&self.ctr, 0, 7);
+        // the decode arena of the current lane; a prefill (batch arena present) computes in lane 0's, see bind_prefill
+        self.bind_at(e, self.lane.get() * self.astride as usize * 4);
+    }
+    fn bind_at(&self, e: &Enc, act_off: usize) {
+        let l = self.lane.get();
+        e.buf(&self.w, 0, 0); e.buf(&self.pb, 0, 1); e.buf(&self.act.borrow(), act_off, 2); e.buf(&self.kv_swa.borrow(), 0, 3);
+        e.buf(&self.cs, l * Self::CS_LANE, 4); e.buf(&self.toks, l * self.toks_lane(), 6);
+        e.buf(&self.ctr, l * Self::CTR_LANE, 7);
+    }
+    /// bytes of the per-lane regions of cs / ctr / toks
+    const CS_LANE: usize = N_SLOT * NCH * 3 * 4;
+    const CTR_LANE: usize = 4096 * 4;
+    fn toks_lane(&self) -> usize { (self.max_ctx + 8) * 4 }
+    /// decode-arena floats of all lanes (the prefill batch arena starts here)
+    fn dec_total(&self) -> u32 { self.astride * self.nlanes as u32 }
+    pub fn lane(&self) -> usize { self.lane.get() }
+    /// Make `l` the current lane: single-sequence operations (prefill, step, reset, save/load_state, set_tokens, ...)
+    /// act on its state. Nothing of the old lane may be pending in a command buffer still being encoded.
+    pub fn select_lane(&self, l: usize) {
+        assert!(l < self.nlanes);
+        let cur = self.lane.get();
+        if l == cur { return; }
+        let mut lk = self.lanes_kv.borrow_mut();
+        let (s, f, sc, fc) = lk[l].take().expect("lane state");
+        let old_s = std::mem::replace(&mut *self.kv_swa.borrow_mut(), s);
+        let old_f = std::mem::replace(&mut *self.kv_full.borrow_mut(), f);
+        lk[cur] = Some((old_s, old_f, self.swa_cap.replace(sc), self.full_cap.replace(fc)));
+        self.lane.set(l);
     }
 
     fn seg(w: &QW, in_off: u32, out_off: u32) -> Seg {
@@ -1680,9 +1739,41 @@ impl Engine {
         self.encode_step_cx(&mut cx, pos, logits, argmax);
         cx.e.end();
     }
+    /// One decode step for several lanes at once: `lanes` holds (lane, position) pairs, each lane's input token read
+    /// from its toks[pos] and (with `argmax`) its greedy next token written to its toks[pos + 1], its logits to its own
+    /// arena (`logits_of`). Every lane's step is recorded exactly as `encode_step` would encode it, with its own
+    /// bindings, then replayed interleaved stage by stage (`Enc::replay`): the lanes' dispatches of a stage run
+    /// concurrently, so the shared dense weights of that stage are read once from DRAM while they are in the caches,
+    /// and the serial latency of the ~500 dependent stages is paid once per step instead of once per lane.
+    /// Each lane needs K/V capacity for its position (`gen_reserve` with that lane selected).
+    pub fn encode_step_batch(&self, cb: &CmdBuf, lanes: &[(usize, usize)], logits: bool, argmax: bool) {
+        assert!(!self.tier_on() && self.prune.borrow().is_none(), "batched steps: no disk tier, no pruning");
+        let cur = self.lane.get();
+        let mut recs = Vec::with_capacity(lanes.len());
+        for &(l, pos) in lanes {
+            self.select_lane(l);
+            assert!(pos < self.kv_capacity(), "K/V capacity of lane {l}: call gen_reserve() first");
+            let mut cx = Cx { e: Enc::recorder(), cb: None };
+            self.encode_step_cx(&mut cx, pos, logits, argmax);
+            recs.push(cx.e.take_commands());
+        }
+        self.select_lane(cur);
+        let e = Enc::new(cb);
+        e.replay(&recs);
+        e.end();
+    }
+    /// `encode_step_batch`, committed
+    pub fn step_batch(&self, lanes: &[(usize, usize)], logits: bool, argmax: bool) -> CmdBuf {
+        let cb = self.gpu.cmd();
+        self.encode_step_batch(&cb, lanes, logits, argmax);
+        cb.commit();
+        cb
+    }
+
     fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
         let e = &cx.e;
         self.bind(e);
+        if logits { self.logits_lane.set(self.lane.get()); }
         let ar = self.ar;
         // embedding -> vec 0 (x0)
         let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
@@ -1962,7 +2053,9 @@ impl Engine {
         assert!(t >= 1 && t <= self.chunk && p0 + t <= self.kv_capacity(), "K/V capacity: call reserve() first");
         assert!(t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
         let e = Enc::new(cb);
-        self.bind(&e);
+        // the batch arena's offsets are absolute: a prefill of any lane computes in lane 0's decode arena (its logits too)
+        self.bind_at(&e, 0);
+        if logits { self.logits_lane.set(0); }
         let b = self.ba.get();
         let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
                              norm_off: self.tok_norm, out0: b.vec(0), out1: b.vec(0), tok_index: p0 as u32, eps: self.eps };

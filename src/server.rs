@@ -12,6 +12,7 @@
 //!   first beyond `--cache-mib`.
 
 use crate::engine::{Engine, StateSnap};
+use objc2_metal::MTLCommandBuffer;
 use crate::sampler::Sampler;
 use crate::session::Session;
 use crate::tokenizer::Tokenizer;
@@ -30,6 +31,8 @@ pub struct ServeOpts {
     pub default_effort: Option<String>,
     pub cache_mib: usize,
     pub top_k: usize,
+    /// sequences decoded together (batched steps); more requests queue
+    pub lanes: usize,
 }
 
 // ------------------------------------------------------------------------------------------------ chat template
@@ -265,110 +268,205 @@ struct Cached { toks: Vec<u32>, snap: StateSnap, used: u64 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
 
+/// a request being served on a lane
+struct Active {
+    job: Job,
+    toks: Vec<u32>,
+    base: usize,
+    restored: bool,
+    /// prefill progress: prompt tokens in the context (the last prompt token is fed by a decode step)
+    next: usize,
+    decoding: bool,
+    sampler: Sampler,
+    parser: Parser,
+    gen: Vec<u32>,
+    /// the last emitted token, input of the next decode step
+    pending: u32,
+    max: usize,
+    ended: bool,
+    gone: bool,
+    t0: Instant,
+    restore_ms: f64,
+    save_ms: f64,
+    prefill_s: f64,
+    t_dec: Option<Instant>,
+    batch_sum: usize,
+    steps: usize,
+}
+
+struct LaneSt<'a> { sess: Session<'a>, live: Vec<u32>, act: Option<Active>, used: u64 }
+
+/// prompt tokens a prefill piece may take while other lanes are decoding (they wait for it)
+const PREFILL_PIECE: usize = 1024;
+
 fn engine_thread(o: &ServeOpts, jobs: Receiver<Job>, ready: Sender<Result<usize, String>>) {
-    let eng = Engine::load(&o.model, o.ctx);
+    let nl = o.lanes.max(1);
+    let eng = Engine::load_lanes(&o.model, o.ctx, nl);
     let tk = Tokenizer::load(&eng.g);
-    let mut sess = Session::new(&eng, &tk);
+    let mut lanes: Vec<LaneSt> = (0..nl).map(|l| LaneSt { sess: Session::on_lane(&eng, &tk, l), live: Vec::new(), act: None, used: 0 }).collect();
     let _ = ready.send(Ok(eng.max_ctx));
-    // tokens whose state is in the engine right now
-    let mut live: Vec<u32> = Vec::new();
+    let mut queue: std::collections::VecDeque<Job> = Default::default();
     let mut cache: Vec<Cached> = Vec::new();
     let budget = o.cache_mib << 20;
     let mut tick = 0u64;
 
-    for job in jobs {
-        tick += 1;
-        let t0 = Instant::now();
-        let toks = tk.encode(&job.prompt, true);
-        let n = toks.len();
-        if n == 0 { let _ = job.ev.send(Event::Error("empty prompt".into())); continue; }
-        if n + 2 >= eng.max_ctx {
-            let _ = job.ev.send(Event::Error(format!("the prompt is {n} tokens; this server's context is {} tokens", eng.max_ctx)));
-            continue;
+    loop {
+        // ---- intake: block only when there is nothing to do
+        if queue.is_empty() && lanes.iter().all(|l| l.act.is_none()) {
+            match jobs.recv() { Ok(j) => queue.push_back(j), Err(_) => return }
         }
+        while let Ok(j) = jobs.try_recv() { queue.push_back(j); }
 
-        // where to start: the live context or a cached conversation, whichever covers more of the prompt (never all
-        // of it: the last prompt token is always prefilled, its logits start the reply)
-        // `"cache_prompt": false` in a request: prefill it from scratch (tests compare the two paths)
-        let live_ok = job.use_cache && sess.pending().is_none() && live.len() < n && common_prefix(&live, &toks) == live.len();
-        let mut base = if live_ok { live.len() } else { 0 };
-        let mut pick: Option<usize> = None;
-        for (i, c) in cache.iter().enumerate() {
-            if !job.use_cache { break; }
-            if c.toks.len() < n && c.toks.len() > base && common_prefix(&c.toks, &toks) == c.toks.len() { base = c.toks.len(); pick = Some(i); }
-        }
-        let t_restore = Instant::now();
-        if let Some(i) = pick {
-            sess.restore(&cache[i].snap);
-            cache[i].used = tick;
-        } else if !live_ok || base == 0 {
-            sess.clear();
-            base = 0;
-        }
-        let restore_ms = t_restore.elapsed().as_secs_f64() * 1e3;
-        live.truncate(0);
-        live.extend_from_slice(&toks[..base]);
-
-        // prefill up to the last token, keep that state, then the last token
-        let t_pf = Instant::now();
-        eng.prepare(n, n - base);
-        if n - 1 > base {
-            sess.prefill_any(&toks[base..n - 1]);
-            live.extend_from_slice(&toks[base..n - 1]);
-        }
-        let mut save_ms = 0.0;
-        if n - 1 > base || pick.is_none() {
-            let ts = Instant::now();
-            // a cached prefix of this prompt is the same conversation one turn back: replace it
-            cache.retain(|c| !(c.toks.len() <= n - 1 && common_prefix(&c.toks, &toks) == c.toks.len()));
-            let snap = eng.save_state(n - 1);
-            cache.push(Cached { toks: toks[..n - 1].to_vec(), snap, used: tick });
-            let mut total: usize = cache.iter().map(|c| c.snap.bytes()).sum();
-            while total > budget && cache.len() > 1 {
-                let (i, _) = cache.iter().enumerate().min_by_key(|(_, c)| c.used).unwrap();
-                total -= cache[i].snap.bytes();
-                cache.remove(i);
+        // ---- admit queued requests into free lanes
+        while !queue.is_empty() && lanes.iter().any(|l| l.act.is_none()) {
+            let job = queue.pop_front().unwrap();
+            tick += 1;
+            let t0 = Instant::now();
+            let toks = tk.encode(&job.prompt, true);
+            let n = toks.len();
+            if n == 0 { let _ = job.ev.send(Event::Error("empty prompt".into())); continue; }
+            if n + 2 >= eng.max_ctx {
+                let _ = job.ev.send(Event::Error(format!("the prompt is {n} tokens; this server's context is {} tokens", eng.max_ctx)));
+                continue;
             }
-            save_ms = ts.elapsed().as_secs_f64() * 1e3;
+            // the longest reusable prefix: a free lane's live context, or a cached conversation (never the whole
+            // prompt: its last token is fed by a decode step, whose logits start the reply)
+            let mut best: (usize, Option<usize>, Option<usize>) = (0, None, None);   // (prefix, lane, cache entry)
+            if job.use_cache {
+                for (i, l) in lanes.iter().enumerate() {
+                    if l.act.is_none() && l.live.len() < n && l.live.len() > best.0 && common_prefix(&l.live, &toks) == l.live.len() {
+                        best = (l.live.len(), Some(i), None);
+                    }
+                }
+                for (i, c) in cache.iter().enumerate() {
+                    if c.toks.len() < n && c.toks.len() > best.0 && common_prefix(&c.toks, &toks) == c.toks.len() { best = (c.toks.len(), None, Some(i)); }
+                }
+            }
+            // the lane: the one holding the prefix, else the free lane used longest ago
+            let li = best.1.unwrap_or_else(|| (0..nl).filter(|&i| lanes[i].act.is_none()).min_by_key(|&i| lanes[i].used).unwrap());
+            let lane = &mut lanes[li];
+            lane.used = tick;
+            let tr = Instant::now();
+            let base = match (best.1, best.2) {
+                (Some(_), _) => best.0,
+                (None, Some(ci)) => { lane.sess.restore(&cache[ci].snap); cache[ci].used = tick; best.0 }
+                _ => { lane.sess.clear(); 0 }
+            };
+            let restore_ms = tr.elapsed().as_secs_f64() * 1e3;
+            lane.live.truncate(base);
+            if best.2.is_some() { lane.live = toks[..base].to_vec(); }
+            eng.select_lane(li);
+            eng.prepare(n, (n - base).min(eng.chunk));
+            let sampler = Sampler::new(job.temp, job.top_k, job.top_p, eng.softcap, job.seed);
+            let max = job.max_tokens.unwrap_or(usize::MAX).min(eng.max_ctx.saturating_sub(n + 2)).max(1);
+            lane.act = Some(Active { job, toks, base, restored: best.2.is_some(), next: base, decoding: false, sampler, parser: Parser::new(),
+                                     gen: Vec::new(), pending: 0, max, ended: false, gone: false, t0, restore_ms, save_ms: 0.0,
+                                     prefill_s: 0.0, t_dec: None, batch_sum: 0, steps: 0 });
         }
-        let first = sess.prefill_any(&toks[n - 1..]);
-        live.push(toks[n - 1]);
-        let pf_s = t_pf.elapsed().as_secs_f64();
 
-        // generate
-        let mut sampler = Sampler::new(job.temp, job.top_k, job.top_p, eng.softcap, job.seed);
-        let max = job.max_tokens.unwrap_or(usize::MAX).min(sess.ctx_left().saturating_sub(2)).max(1);
-        let mut parser = Parser::new();
-        let mut gen: Vec<u32> = Vec::new();
-        let mut ended = false;
-        let mut gone = false;
-        let t_gen = Instant::now();
-        sess.generate(first, max, &mut sampler, |t| {
-            gen.push(t);
+        let n_dec = lanes.iter().filter(|l| l.act.as_ref().is_some_and(|a| a.decoding)).count();
+
+        // ---- prefill: the oldest prefilling request gets one piece (all of its prompt when no lane is decoding)
+        let pre = (0..nl).filter(|&i| lanes[i].act.as_ref().is_some_and(|a| !a.decoding)).min_by_key(|&i| lanes[i].act.as_ref().unwrap().t0);
+        if let Some(li) = pre {
+            let lane = &mut lanes[li];
+            let a = lane.act.as_mut().unwrap();
+            let n = a.toks.len();
+            let tp = Instant::now();
+            if a.next < n - 1 {
+                let room = if n_dec == 0 { usize::MAX } else { PREFILL_PIECE };
+                let mut end = a.next.saturating_add(room).min(n - 1);
+                if n - 1 - end == 1 { end = n - 1; }        // never leave a lone token behind (see Session::feed_one)
+                lane.sess.prefill_any(&a.toks[a.next..end]);
+                lane.live.extend_from_slice(&a.toks[a.next..end]);
+                a.next = end;
+            }
+            if a.next == n - 1 {
+                // the prompt but its last token is in: keep that state for this conversation's next turn
+                if n - 1 > a.base || !a.restored {
+                    let ts = Instant::now();
+                    cache.retain(|c| !(c.toks.len() <= n - 1 && common_prefix(&c.toks, &a.toks) == c.toks.len()));
+                    cache.push(Cached { toks: a.toks[..n - 1].to_vec(), snap: lane.sess.save(), used: tick });
+                    let mut total: usize = cache.iter().map(|c| c.snap.bytes()).sum();
+                    while total > budget && cache.len() > 1 {
+                        let (i, _) = cache.iter().enumerate().min_by_key(|(_, c)| c.used).unwrap();
+                        total -= cache[i].snap.bytes();
+                        cache.remove(i);
+                    }
+                    a.save_ms = ts.elapsed().as_secs_f64() * 1e3;
+                }
+                let last = a.toks[n - 1];
+                let first = lane.sess.feed_one(last);
+                lane.live.push(last);
+                let tok = if a.sampler.greedy() { first } else { a.sampler.sample(eng.logits_of(li)) };
+                a.decoding = true;
+                a.t_dec = Some(Instant::now());
+                emit(&tk, a, tok);
+            }
+            a.prefill_s += tp.elapsed().as_secs_f64();
+        }
+
+        // ---- decode: one batched step for every decoding lane that is not done
+        let step_lanes: Vec<usize> = (0..nl).filter(|&i| lanes[i].act.as_ref().is_some_and(|a| a.decoding && !done(a, &lanes[i].sess))).collect();
+        if !step_lanes.is_empty() {
+            let mut lp = Vec::with_capacity(step_lanes.len());
+            for &li in &step_lanes {
+                let lane = &lanes[li];
+                let pos = lane.sess.n_past;
+                eng.select_lane(li);
+                eng.set_tokens(pos, &[lane.act.as_ref().unwrap().pending]);
+                eng.gen_reserve(pos);
+                lp.push((li, pos));
+            }
+            eng.step_batch(&lp, true, true).waitUntilCompleted();
+            let nb = lp.len();
+            for &(li, pos) in &lp {
+                let lane = &mut lanes[li];
+                let a = lane.act.as_mut().unwrap();
+                lane.sess.n_past = pos + 1;
+                lane.live.push(a.pending);
+                a.batch_sum += nb;
+                a.steps += 1;
+                let tok = if a.sampler.greedy() { eng.token_at_lane(li, pos + 1) } else { a.sampler.sample(eng.logits_of(li)) };
+                emit(&tk, a, tok);
+            }
+        }
+
+        // ---- finished requests
+        for li in 0..nl {
+            let fin = lanes[li].act.as_ref().is_some_and(|a| a.decoding && done(a, &lanes[li].sess));
+            if !fin { continue; }
+            let lane = &mut lanes[li];
+            let mut a = lane.act.take().unwrap();
             let mut evs = Vec::new();
-            ended = parser.push(&tk, t, &mut evs);
-            for e in evs { if job.ev.send(e).is_err() { gone = true; } }
-            !ended && !gone
-        });
-        let gen_s = t_gen.elapsed().as_secs_f64();
-        // the engine stops at EOS without passing it on: fewer tokens than the budget means the turn ended
-        if !ended && !gone && gen.len() < max { ended = true; }
-        { let mut evs = Vec::new(); parser.finish(&mut evs); for e in evs { let _ = job.ev.send(e); } }
-        // the context now holds the prompt and the generated tokens that went through the model
-        let mut all = toks.clone();
-        all.extend_from_slice(&gen);
-        all.truncate(sess.n_past);
-        live = all;
-        sess.drop_pending();
-        let finish = if parser.n_tools > 0 { "tool_calls" } else if ended { "stop" } else { "length" };
-        let _ = job.ev.send(Event::Done { finish, prompt_tokens: n, cached_tokens: base, completion_tokens: gen.len(), reasoning_tokens: parser.n_thinking });
-        let cached_gib = cache.iter().map(|c| c.snap.bytes()).sum::<usize>() as f64 / (1u64 << 30) as f64;
-        eprintln!("[serve] prompt {n} tok (cached {base}{}) prefill {} tok {:.0} ms ({:.0} tok/s) | decode {} tok {:.1} tok/s | \
-                   restore {restore_ms:.0} ms save {save_ms:.0} ms | {} conversations {cached_gib:.2} GiB | {finish}{} | {:.1} s",
-                  if pick.is_some() { ", restored" } else if base > 0 { ", live" } else { "" },
-                  n - base, pf_s * 1e3, (n - base) as f64 / pf_s, gen.len(), gen.len() as f64 / gen_s,
-                  cache.len(), if gone { " (client gone)" } else { "" }, t0.elapsed().as_secs_f64());
+            a.parser.finish(&mut evs);
+            for e in evs { let _ = a.job.ev.send(e); }
+            let finish = if a.parser.n_tools > 0 { "tool_calls" } else if a.ended { "stop" } else { "length" };
+            let n = a.toks.len();
+            let _ = a.job.ev.send(Event::Done { finish, prompt_tokens: n, cached_tokens: a.base, completion_tokens: a.gen.len(),
+                                                reasoning_tokens: a.parser.n_thinking });
+            let dec_s = a.t_dec.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let cached_gib = cache.iter().map(|c| c.snap.bytes()).sum::<usize>() as f64 / (1u64 << 30) as f64;
+            eprintln!("[serve] lane {li} | prompt {n} tok (cached {}{}) prefill {} tok in {:.0} ms | decode {} tok {:.1} tok/s, batch {:.1} | \
+                       restore {:.0} ms save {:.0} ms | {} conversations {cached_gib:.2} GiB | {finish}{} | {:.1} s",
+                      a.base, if a.restored { ", restored" } else if a.base > 0 { ", live" } else { "" }, n - a.base, a.prefill_s * 1e3,
+                      a.gen.len(), a.gen.len() as f64 / dec_s.max(1e-9), a.batch_sum as f64 / a.steps.max(1) as f64,
+                      a.restore_ms, a.save_ms, cache.len(), if a.gone { " (client gone)" } else { "" }, a.t0.elapsed().as_secs_f64());
+        }
     }
+}
+
+/// whether a decoding request is over (EOS, end of turn, budget, context, or the client left)
+fn done(a: &Active, sess: &Session) -> bool { a.ended || a.gone || a.gen.len() >= a.max || sess.ctx_left() < 3 }
+
+/// account for one sampled token: EOS ends the turn without being emitted, as in Session::generate
+fn emit(tk: &Tokenizer, a: &mut Active, tok: u32) {
+    if tok == tk.eos { a.ended = true; return; }
+    a.gen.push(tok);
+    a.pending = tok;
+    let mut evs = Vec::new();
+    if a.parser.push(tk, tok, &mut evs) { a.ended = true; }
+    for e in evs { if a.job.ev.send(e).is_err() { a.gone = true; } }
 }
 
 // ------------------------------------------------------------------------------------------------ HTTP
@@ -519,13 +617,13 @@ pub fn serve(o: ServeOpts) {
     let (jobs_tx, jobs_rx) = channel::<Job>();
     let (ready_tx, ready_rx) = channel();
     let eo = ServeOpts { model: o.model.clone(), ctx: o.ctx, host: o.host.clone(), port: o.port, aliases: o.aliases.clone(),
-                         default_effort: o.default_effort.clone(), cache_mib: o.cache_mib, top_k: o.top_k };
+                         default_effort: o.default_effort.clone(), cache_mib: o.cache_mib, top_k: o.top_k, lanes: o.lanes };
     std::thread::spawn(move || engine_thread(&eo, jobs_rx, ready_tx));
     let ctx = match ready_rx.recv() { Ok(Ok(c)) => c, _ => { eprintln!("[serve] the engine failed to start"); std::process::exit(1) } };
     let addr = format!("{}:{}", o.host, o.port);
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| { eprintln!("[serve] cannot listen on {addr}: {e}"); std::process::exit(1) });
-    eprintln!("[serve] ready: http://{addr}/v1 | models {:?} | context {ctx} | conversation cache {} MiB | default effort {}",
-              o.aliases, o.cache_mib, o.default_effort.as_deref().unwrap_or("template (high)"));
+    eprintln!("[serve] ready: http://{addr}/v1 | models {:?} | context {ctx} per lane | {} lanes | conversation cache {} MiB | default effort {}",
+              o.aliases, o.lanes, o.cache_mib, o.default_effort.as_deref().unwrap_or("template (high)"));
     for s in listener.incoming() {
         let Ok(s) = s else { continue };
         let (jobs, aliases, eff, top_k) = (jobs_tx.clone(), o.aliases.clone(), o.default_effort.clone(), o.top_k);

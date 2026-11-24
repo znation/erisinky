@@ -27,7 +27,8 @@ commands:
   check --ref P     compare logits against a llama.cpp reference dump (tools/ref_logits)
   serve             OpenAI-compatible HTTP server: --host H --port P (default 127.0.0.1:8090), --alias NAME (repeatable;
                     the first is reported), --default-effort E (requests without reasoning_effort; default: the
-                    template's, high), --cache-mib N (conversation cache, default 8192), -c CTX (default 131072)
+                    template's, high), --cache-mib N (conversation cache, default 8192), -c CTX (per lane, default
+                    131072), --lanes N (requests decoded together in batched steps, default 1; more queue)
 
 options:
   -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
@@ -49,7 +50,7 @@ struct Opts {
     model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
     system: String, temp: f32, top_p: f32, top_k: usize, seed: u64, hide_thinking: bool, n_set: bool,
     // serve
-    host: String, port: u16, aliases: Vec<String>, default_effort: Option<String>, cache_mib: usize, ctx_set: bool,
+    host: String, port: u16, aliases: Vec<String>, default_effort: Option<String>, cache_mib: usize, ctx_set: bool, lanes: usize,
 }
 
 fn parse() -> (String, Opts) {
@@ -59,7 +60,7 @@ fn parse() -> (String, Opts) {
     let mut o = Opts { model: DEFAULT_MODEL.replace('~', &home), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
                        raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
                        temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false,
-                       host: "127.0.0.1".into(), port: 8090, aliases: Vec::new(), default_effort: None, cache_mib: 8192, ctx_set: false };
+                       host: "127.0.0.1".into(), port: 8090, aliases: Vec::new(), default_effort: None, cache_mib: 8192, ctx_set: false, lanes: 1 };
     while let Some(a) = args.next() {
         let mut v = || args.next().unwrap_or_else(|| { eprintln!("missing value for {a}"); std::process::exit(2) });
         match a.as_str() {
@@ -73,6 +74,7 @@ fn parse() -> (String, Opts) {
             "--alias" => o.aliases.push(v()),
             "--default-effort" => o.default_effort = Some(v()),
             "--cache-mib" => o.cache_mib = v().parse().unwrap(),
+            "--lanes" => o.lanes = v().parse().unwrap(),
             "--raw" => o.raw = true,
             "--kv8" => engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed),
             "--kv-disk" => engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -138,6 +140,92 @@ fn run(o: &Opts) {
     eprintln!("\n[inkling] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
               s.prompt_tokens, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(), s.gen_tokens, s.gen_tokens as f64 / s.gen_time.as_secs_f64(),
               if sampler.greedy() { " (greedy)" } else { "" }, kv_note(&eng, sess.n_past), sess.n_past);
+}
+
+/// dev: prefill different prompts into `--lanes` lanes, then decode -n greedy tokens per lane twice from the same
+/// state - one lane at a time, then all lanes in batched steps - and compare tokens and speed
+fn batchtest(o: &Opts) {
+    let nl = o.lanes.max(1);
+    let eng = Engine::load_lanes(&o.model, o.ctx, nl);
+    let tk = Tokenizer::load(&eng.g);
+    let text: Vec<char> = o.prompt.chars().collect();
+    let mut snaps = Vec::new();
+    let mut firsts = Vec::new();
+    for l in 0..nl {
+        eng.select_lane(l);
+        let mut sess = Session::new(&eng, &tk);
+        // lane l: a different slice of the prompt file, different lengths
+        let a = (l * text.len() / (nl + 1)).min(text.len());
+        let b = (a + text.len() / (nl + 1) * (l + 2) / 2).min(text.len());
+        let piece: String = text[a..b].iter().collect();
+        let toks = tk.encode(&first_turn(o, &format!("{piece}\n\nContinue this text.")), true);
+        eng.prepare(toks.len(), toks.len());
+        let first = sess.prefill(&toks);
+        firsts.push((first, sess.n_past));
+        snaps.push(eng.save_state(sess.n_past));
+        eprintln!("[batchtest] lane {l}: {} prompt tokens", toks.len());
+    }
+    eng.release_batch();
+    let n = o.n.min(256);
+    // one lane at a time
+    let mut seq: Vec<Vec<u32>> = Vec::new();
+    let t0 = std::time::Instant::now();
+    for l in 0..nl {
+        eng.select_lane(l);
+        eng.load_state(&snaps[l]);
+        let (mut tok, mut pos) = firsts[l];
+        let mut out = vec![tok];
+        for _ in 0..n {
+            eng.set_tokens(pos, &[tok]);
+            eng.gen_reserve(pos);
+            eng.step(pos, true, true).waitUntilCompleted();
+            tok = eng.token_at(pos + 1);
+            pos += 1;
+            out.push(tok);
+        }
+        seq.push(out);
+    }
+    let t_seq = t0.elapsed().as_secs_f64();
+    // all lanes in batched steps, from the same states
+    let mut st: Vec<(u32, usize)> = Vec::new();
+    for l in 0..nl { eng.select_lane(l); eng.load_state(&snaps[l]); st.push(firsts[l]); }
+    let mut bat: Vec<Vec<u32>> = (0..nl).map(|l| vec![firsts[l].0]).collect();
+    let t1 = std::time::Instant::now();
+    let (mut enc_s, mut gpu_s) = (0.0f64, 0.0f64);
+    for _ in 0..n {
+        let mut lanes = Vec::new();
+        for l in 0..nl {
+            eng.select_lane(l);
+            let (tok, pos) = st[l];
+            eng.set_tokens(pos, &[tok]);
+            eng.gen_reserve(pos);
+            lanes.push((l, pos));
+        }
+        let te = std::time::Instant::now();
+        let cb = eng.gpu.cmd();
+        eng.encode_step_batch(&cb, &lanes, true, true);
+        enc_s += te.elapsed().as_secs_f64();
+        cb.commit();
+        cb.waitUntilCompleted();
+        gpu_s += cb.GPUEndTime() - cb.GPUStartTime();
+        for l in 0..nl {
+            let (_, pos) = st[l];
+            let t = eng.token_at_lane(l, pos + 1);
+            st[l] = (t, pos + 1);
+            bat[l].push(t);
+        }
+    }
+    let t_bat = t1.elapsed().as_secs_f64();
+    for l in 0..nl {
+        let same = seq[l] == bat[l];
+        let d = seq[l].iter().zip(&bat[l]).position(|(a, b)| a != b);
+        eprintln!("[batchtest] lane {l}: identical={same}{}  {:?}", d.map(|i| format!(" (first difference at token {i})")).unwrap_or_default(),
+                  String::from_utf8_lossy(&seq[l].iter().flat_map(|&t| tk.decode_bytes(t)).collect::<Vec<u8>>()).chars().take(70).collect::<String>());
+    }
+    eprintln!("[batchtest] batched step: {:.1} ms GPU, {:.1} ms CPU encoding (record + replay)", gpu_s * 1e3 / n as f64, enc_s * 1e3 / n as f64);
+    let tot = (nl * n) as f64;
+    eprintln!("[batchtest] {nl} lanes x {n} tokens: one at a time {:.1} tok/s ({:.1} ms/step) | batched {:.1} tok/s ({:.1} ms/step) | x{:.2}",
+              tot / t_seq, t_seq * 1e3 / tot, tot / t_bat, t_bat * 1e3 / n as f64, t_seq / t_bat);
 }
 
 fn chat(o: &Opts) {
@@ -646,13 +734,14 @@ fn main() {
         "serve" => server::serve(server::ServeOpts {
             model: o.model.clone(), ctx: if o.ctx_set { o.ctx } else { 131072 }, host: o.host.clone(), port: o.port,
             aliases: if o.aliases.is_empty() { vec!["Inkling-2-Mini".into()] } else { o.aliases.clone() },
-            default_effort: o.default_effort.clone(), cache_mib: o.cache_mib, top_k: 128,
+            default_effort: o.default_effort.clone(), cache_mib: o.cache_mib, top_k: 128, lanes: o.lanes,
         }),
         // dev: print the prompt `serve` renders for a chat request (JSON body in -f FILE)
         "render" => {
             let req: serde_json::Value = serde_json::from_str(&o.prompt).expect("request JSON");
             match server::render(&req, o.default_effort.as_deref()) { Ok(p) => print!("{p}"), Err(e) => { eprintln!("{e}"); std::process::exit(1) } }
         }
+        "batchtest" => batchtest(&o),
         "run" => run(&o),
         "chat" => chat(&o),
         "bench" => bench(&o),
