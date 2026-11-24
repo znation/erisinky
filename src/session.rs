@@ -70,7 +70,8 @@ impl<'a> Session<'a> {
     pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> usize {
         let t0 = Instant::now();
         let eng = self.eng;
-        let eos = self.tk.eos;
+        // INK_IGNORE_EOS (benchmarks): decode exactly `max` tokens, as llama-bench's tg does
+        let eos = if std::env::var("INK_IGNORE_EOS").is_ok() { u32::MAX } else { self.tk.eos };
         eng.release_batch();      // the prefill arena is not needed while generating
         let mut tok = if sampler.greedy() { first } else { sampler.sample(eng.logits()) };
         let mut n = 1usize;

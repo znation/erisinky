@@ -12,6 +12,10 @@ pub type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Pso = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type CmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
+/// default number of split-K partitions of a decode attention for this GPU: 8 fills a 20-core M5 Pro; measured on a
+/// 40-core M5 Max (Low Power Mode, Q4_K_M), 16 is +6 % decode at 32K context and +6-10 % at 64K (equal at 2.4K)
+pub static GPU_SPLITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 pub struct Gpu {
     pub dev: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -29,6 +33,9 @@ impl Gpu {
         let lib = dev
             .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
             .unwrap_or_else(|e| panic!("Metal compile failed:\n{}", e.localizedDescription()));
+        // the decode attention's split-K width follows the GPU's size (see Engine::split_target)
+        let name = dev.name().to_string();
+        let _ = GPU_SPLITS.set(if name.contains("Ultra") { 32 } else if name.contains("Max") { 16 } else { 8 });
         let g = Gpu { dev, queue, lib, psos: Default::default() };
         for k in kernels { g.pso(k); }
         g

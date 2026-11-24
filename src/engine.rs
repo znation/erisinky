@@ -654,7 +654,9 @@ impl Engine {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * self.max_ctx + p }) * REC) as u64
     }
-    fn split_target() -> usize { std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) }
+    fn split_target() -> usize {
+        std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| *crate::metal::GPU_SPLITS.get().unwrap_or(&8))
+    }
     /// keys per split of a decode attention over `nk` keys (the same division with and without the disk tier, so both sum
     /// the same keys in the same order)
     fn split_kps(nk: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
